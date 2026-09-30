@@ -5,8 +5,13 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "httpx>=0.28.1",
     "langchain>=1.4.0",
     "langchain-openai>=1.6.0",
     "langgraph>=1.2.11",
     "langgraph-cli[inmem]>=0.4.31",
+    "python-dotenv>=1.2.3",
+    "tzdata>=2026.4",
+    "youtube-transcript-api>=1.2.4",
+    "yt-dlp>=2026.8.19",
 ]

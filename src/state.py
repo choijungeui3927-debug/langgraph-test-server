@@ -1,8 +1,22 @@
 # src/state.py
-from langgraph.graph import MessagesState
+import operator
+from typing import Annotated, TypedDict
 
-# MessagesState 상속. 나머지 항목은 필요에 따라서 본인이 추가 가능
-class JokeState(MessagesState):
-    joke: str          # 생성된 최신 농담 텍스트
-    score: int         # 평가 점수 (1~10)
-    feedback: str      # 평가 피드백 및 개선점
+
+class NewsState(TypedDict, total=False):
+    # 입력 (모두 선택): 비우면 오늘 날짜(KST)와 config.CHANNELS 사용
+    target_date: str  # "YYYY-MM-DD"
+    channels: dict[str, str]  # {"@handle": "표시 이름"}
+
+    # 중간 결과
+    videos: list[dict]
+    summaries: Annotated[list[dict], operator.add]  # 병렬 요약 결과가 누적됨
+    skipped: Annotated[list[dict], operator.add]  # 자막 없음 등으로 제외된 영상
+
+    # 최종 결과
+    digest: str
+
+
+class VideoState(TypedDict):
+    """summarize_video 노드 하나에 전달되는 개별 영상 상태."""
+    video: dict
