@@ -127,6 +127,12 @@ def _fetch_via_apify(video_id: str, token: str) -> str | None:
     return " ".join(s["text"].strip() for s in segments if s.get("text", "").strip())
 
 
+def get_cached_transcript(video_id: str) -> str | None:
+    """캐시에 저장된 자막만 읽는다. 네트워크 요청이나 비용이 발생하지 않는다."""
+    cache = Path(TRANSCRIPT_CACHE_DIR) / f"{video_id}.txt"
+    return cache.read_text(encoding="utf-8") if cache.exists() else None
+
+
 def get_transcript(video_id: str) -> str | None:
     """한국어 자막(수동 우선, 없으면 자동 생성)을 하나의 문자열로 반환한다.
 

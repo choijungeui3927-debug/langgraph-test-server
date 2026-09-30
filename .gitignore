@@ -174,3 +174,9 @@ poetry.toml
 pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/python
+
+# 날짜별 요약 결과
+data/
+
+# LangGraph dev 서버 로컬 상태
+.langgraph_api/

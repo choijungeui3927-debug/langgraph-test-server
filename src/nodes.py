@@ -16,6 +16,7 @@ from src.config import (
     SUMMARY_MODEL,
 )
 from src.state import NewsState, VideoState
+from src.storage import save_day
 from src.youtube import (
     ApifyBudgetExceededError,
     TranscriptBlockedError,
@@ -128,4 +129,6 @@ def write_digest(state: NewsState) -> dict:
         date=state["target_date"],
         summaries="\n\n".join(_format_summary(s) for s in summaries),
     ))
+    # 채팅 그래프에서 그날 뉴스를 다시 불러올 수 있도록 저장
+    save_day(state["target_date"], state.get("videos") or [], summaries, response.content)
     return {"digest": response.content}

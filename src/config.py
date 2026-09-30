@@ -15,7 +15,7 @@ CHANNELS: dict[str, str] = {
 MAX_VIDEOS_PER_CHANNEL = 30
 
 # 하루에 요약할 최대 영상 수 (자막 요청을 줄여 유튜브 IP 차단 위험을 낮춤)
-MAX_VIDEOS_TOTAL = 10
+MAX_VIDEOS_TOTAL = 5
 
 # 자막 길이 제한 (문자 수): 너무 짧으면 건너뛰고, 너무 길면 잘라서 요약
 MIN_TRANSCRIPT_CHARS = 300
@@ -23,6 +23,9 @@ MAX_TRANSCRIPT_CHARS = 20_000
 
 # 받은 자막을 저장해 두는 폴더 (재실행 시 유튜브 재요청 방지)
 TRANSCRIPT_CACHE_DIR = ".cache/transcripts"
+
+# 날짜별 요약 결과(영상 목록·요약·브리핑)를 저장하는 폴더. 채팅 그래프가 여기서 읽는다.
+DATA_DIR = "data"
 
 # 유튜브가 IP를 차단했을 때 자막을 대신 가져올 Apify Actor (APIFY_API_TOKEN 필요)
 APIFY_TRANSCRIPT_ACTOR = "pintostudio~youtube-transcript-scraper"
@@ -33,3 +36,4 @@ APIFY_MONTHLY_BUDGET_USD = 4.0
 # 모델 설정
 SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "gpt-5.4-mini")
 DIGEST_MODEL = os.getenv("DIGEST_MODEL", "gpt-5.4")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-5.4")
