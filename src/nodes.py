@@ -1,4 +1,6 @@
 # src/nodes.py
+import math
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 
 import httpx
@@ -10,8 +12,8 @@ from src.config import (
     CLOSING_KEYWORDS,
     DIGEST_MODEL,
     KST,
-    MAX_TRANSCRIPT_CHARS,
     MIN_TRANSCRIPT_CHARS,
+    SINGLE_PASS_MAX_CHARS,
     SELECT_MODEL,
     SUMMARY_MODEL,
     US_CLOSE_UPLOAD_BEFORE_HOUR,
@@ -213,6 +215,69 @@ _SUMMARY_PROMPT = """다음은 한국어 금융·경제 유튜브 영상의 자�
 {transcript}"""
 
 
+_MERGE_PROMPT = """다음은 한 유튜브 금융·경제 방송을 시간 구간별로 나눠 요약한 결과입니다.
+이를 합쳐 영상 전체의 요약 하나를 만드세요.
+
+규칙:
+- 같은 주장이나 같은 사실이 여러 구간에 나오면 한 번만 씁니다.
+- 핵심(key_points)마다 그 내용이 나온 구간의 시작 시각을 앞에 [분:초]로 표기합니다.
+- 영상 앞부분에 치우치지 말고 전체에서 중요한 내용을 고릅니다.
+- 출연자의 의견과 사실을 구분하고, 의견이면 누구의 견해인지 밝힙니다.
+
+채널: {channel}
+제목: {title}
+
+구간별 요약:
+{sections}"""
+
+
+def _summarize_once(video: dict, title: str, text: str) -> VideoSummary:
+    llm = ChatOpenAI(model=SUMMARY_MODEL).with_structured_output(VideoSummary)
+    return llm.invoke(_SUMMARY_PROMPT.format(channel=video["channel"], title=title, transcript=text))
+
+
+def _sections(video: dict, transcript: str) -> list[dict]:
+    """자막을 균등한 구간으로 나눈다 → [{start, text}].
+
+    구간 수 = ceil(글자 수 / SINGLE_PASS_MAX_CHARS), 구간 크기 = 글자 수 / 구간 수 (예: 45,000자 → 15,000자 × 3).
+    경계는 타임스탬프(자막 구간 경계)에 맞추고, 타임스탬프가 없는 예전 형식이면 글자 위치로 나누고 start는 None.
+    """
+    n = math.ceil(len(transcript) / SINGLE_PASS_MAX_CHARS)
+    try:
+        segments = get_segments(video)
+    except Exception:
+        segments = None
+    if not segments:
+        size = math.ceil(len(transcript) / n)
+        return [{"start": None, "text": transcript[i: i + size]} for i in range(0, len(transcript), size)]
+
+    total = sum(len(s["text"]) + 1 for s in segments)
+    groups: list[list[dict]] = [[] for _ in range(n)]
+    pos = 0
+    for s in segments:
+        mid = pos + len(s["text"]) / 2  # 구간 가운데 글자가 속한 쪽으로 배정해 경계 오차를 줄인다
+        groups[min(int(mid * n / total), n - 1)].append(s)
+        pos += len(s["text"]) + 1
+    return [{"start": g[0]["start"], "text": " ".join(s["text"] for s in g)} for g in groups if g]
+
+
+def _summarize_by_sections(video: dict, sections: list[dict]) -> VideoSummary:
+    """구간별로 요약(병렬)한 뒤 합친다. 같은 주장은 한 번만, 핵심마다 구간 시작 시각을 붙인다."""
+    def label(s: dict) -> str:
+        return mmss(s["start"]) if s["start"] is not None else f"구간 {sections.index(s) + 1}"
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        parts = list(pool.map(
+            lambda s: _summarize_once(video, f"{video['title']} ({label(s)}부터)", s["text"]), sections,
+        ))
+    merged = "\n\n".join(
+        f"[구간 시작 {label(s)}]\n헤드라인: {p.headline}\n" + "\n".join(f"- {k}" for k in p.key_points)
+        for s, p in zip(sections, parts)
+    )
+    llm = ChatOpenAI(model=SUMMARY_MODEL).with_structured_output(VideoSummary)
+    return llm.invoke(_MERGE_PROMPT.format(channel=video["channel"], title=video["title"], sections=merged))
+
+
 def summarize_video(state: VideoState) -> dict:
     video = state["video"]
     try:
@@ -226,13 +291,14 @@ def summarize_video(state: VideoState) -> dict:
     if not transcript or len(transcript) < MIN_TRANSCRIPT_CHARS:
         return {"skipped": [{**video, "reason": "자막 없음 또는 너무 짧음"}]}
 
-    llm = ChatOpenAI(model=SUMMARY_MODEL).with_structured_output(VideoSummary)
-    result: VideoSummary = llm.invoke(_SUMMARY_PROMPT.format(
-        channel=video["channel"],
-        title=video["title"],
-        transcript=transcript[:MAX_TRANSCRIPT_CHARS],
-    ))
-    _log(f"    요약 완료 — {video['title'][:40]}")
+    if len(transcript) <= SINGLE_PASS_MAX_CHARS:
+        result = _summarize_once(video, video["title"], transcript)
+        how = "한 번에"
+    else:
+        sections = _sections(video, transcript)
+        result = _summarize_by_sections(video, sections)
+        how = f"구간 {len(sections)}개"
+    _log(f"    요약 완료 ({len(transcript):,}자, {how}) — {video['title'][:40]}")
     return {"summaries": [{**video, **result.model_dump()}]}
 
 
