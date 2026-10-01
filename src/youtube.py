@@ -1,5 +1,6 @@
 # src/youtube.py
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from pathlib import Path
 
@@ -22,6 +23,10 @@ from src.config import (
     MAX_VIDEOS_PER_CHANNEL,
     TRANSCRIPT_CACHE_DIR,
 )
+
+
+# 이보다 오래된 영상은 목록에 '1 day ago'처럼 일 단위로만 표시된다
+COARSE_TIMESTAMP_AGE_SECONDS = 20 * 3600
 
 
 class TranscriptBlockedError(Exception):
@@ -59,21 +64,45 @@ def _list_entries(handle: str, lang: str | None = None) -> list[dict]:
     return info.get("entries") or []
 
 
+def _exact_timestamp(video_id: str) -> int | None:
+    """영상 페이지에서 정확한 업로드 시각(Unix 초)을 가져온다. 자막 요청과 달리 IP 차단 대상이 아니다."""
+    opts = {"skip_download": True, "quiet": True, "no_warnings": True}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False, process=False)
+    except Exception:
+        return None
+    return info.get("timestamp") or info.get("release_timestamp")
+
+
 def list_videos_on(handle: str, channel_name: str, target: date) -> list[dict]:
     """채널의 '동영상' 탭에서 target 날짜(KST)에 올라온 영상 목록을 반환한다.
 
-    업로드 시각은 '3 hours ago' 같은 상대 표기로 계산된 근사값이라 시간 단위 오차가 있다.
+    목록의 업로드 시각은 '3 hours ago' 같은 상대 표기로 계산된 근사값이다.
+    하루가 지나면 '1 day ago'처럼 일 단위로만 표시되어 날짜가 하루까지 틀릴 수 있으므로,
+    그런 영상 중 target 근처인 것은 영상 페이지에서 정확한 시각을 다시 가져온다.
     yt-dlp는 영어 상대 표기만 해석할 수 있으므로 날짜는 기본(영어) 조회에서,
     제목은 자동 번역되지 않은 원문을 얻기 위해 한국어 조회에서 가져온다.
     """
-    entries = _list_entries(handle)
+    entries = [
+        e for e in _list_entries(handle)
+        if e.get("timestamp") is not None and e.get("live_status") not in ("is_live", "is_upcoming")
+    ]
     ko_titles = {e["id"]: e.get("title") for e in _list_entries(handle, lang="ko")}
+
+    # 일 단위 근사값이고 target 앞뒤 하루 안에 있는 영상만 정확한 시각을 다시 조회
+    now = datetime.now(KST).timestamp()
+    to_refine = [
+        e for e in entries
+        if now - e["timestamp"] >= COARSE_TIMESTAMP_AGE_SECONDS
+        and abs((datetime.fromtimestamp(e["timestamp"], KST).date() - target).days) <= 1
+    ]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        exact = dict(zip((e["id"] for e in to_refine), pool.map(_exact_timestamp, (e["id"] for e in to_refine))))
 
     videos = []
     for entry in entries:
-        ts = entry.get("timestamp")
-        if ts is None or entry.get("live_status") in ("is_live", "is_upcoming"):
-            continue
+        ts = exact.get(entry["id"]) or entry["timestamp"]
         published = datetime.fromtimestamp(ts, KST)
         if published.date() != target:
             continue

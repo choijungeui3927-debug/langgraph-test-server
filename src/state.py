@@ -13,8 +13,11 @@ class NewsState(TypedDict, total=False):
     summaries: Annotated[list[dict], operator.add]  # 병렬 요약 결과가 누적됨
     skipped: Annotated[list[dict], operator.add]  # 자막 없음 등으로 제외된 영상
 
+    facts: dict  # 코드가 확정한 숫자 (지수, 수급, 환율, 종목 등락률)
+
     # 최종 결과
     digest: str
+    fact_check: dict  # 브리핑 숫자 검증 결과
 
 
 class VideoState(TypedDict):

@@ -180,3 +180,6 @@ data/
 
 # LangGraph dev 서버 로컬 상태
 .langgraph_api/
+
+# 실행 로그
+logs/

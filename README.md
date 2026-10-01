@@ -6,12 +6,20 @@
 
 | 그래프 | 역할 |
 |---|---|
-| `agent` ([src/app.py](src/app.py)) | 영상 수집 → 영상별 요약(병렬) → 브리핑 작성 후 `data/날짜.json`에 저장 |
+| `agent` ([src/app.py](src/app.py)) | 영상 수집 → 확정 숫자 수집 → 영상별 요약(병렬) → 브리핑 작성·숫자 검증 후 `data/날짜.json`·`data/날짜.md`에 저장 |
 | `chat` ([src/chat.py](src/chat.py)) | 저장된 브리핑·요약·자막 원문을 도구로 찾아보며 그날 시장에 대해 대화 |
 
 ```
-fetch_videos → summarize_video (영상마다 병렬) → write_digest
+fetch_videos → collect_facts → summarize_video (영상마다 병렬) → write_digest
 ```
+
+### 숫자 레이어 ([src/facts.py](src/facts.py))
+
+브리핑의 지수·투자자별 순매수·원/달러·종목 등락률은 LLM이 아니라 코드가 확정합니다.
+
+- `collect_facts`: 자막에서 언급된 상장 종목을 추출하고 KRX(pykrx)·한국은행 ECOS에서 숫자를 가져와 `facts`로 저장
+- `write_digest`: 확정 숫자와 `FACT_RULES`를 넣어 브리핑 작성 → `verify()`로 검사 → 오류가 있으면 1회 재생성 → 그래도 남으면 `logs/fact_check.log`에 기록
+- 브리핑 맨 위 '오늘의 숫자' 섹션은 `render_numbers()`가 생성
 
 | 파일 | 내용 |
 |---|---|
@@ -29,6 +37,11 @@ fetch_videos → summarize_video (영상마다 병렬) → write_digest
 ```
 OPENAI_API_KEY=...
 
+# 숫자 레이어: KRX 정보데이터시스템 계정 (지수·수급·종목), 한국은행 ECOS 키 (환율)
+KRX_ID=...
+KRX_PW=...
+ECOS_API_KEY=...
+
 # 선택: 유튜브가 IP를 차단했을 때 자막을 대신 받아옴
 APIFY_API_TOKEN=...
 
@@ -39,7 +52,7 @@ LANGSMITH_API_KEY=...
 LANGSMITH_PROJECT=...
 ```
 
-`.env`에는 한글을 쓰지 마세요. Windows에서 `langgraph dev`가 파일을 읽지 못합니다.
+`.env`에는 한글을 쓰지 말고, `이름=값` 사이에 공백을 넣지 마세요. Windows에서 `langgraph dev`가 파일을 읽지 못하거나 키를 찾지 못합니다.
 
 ## 사용법 (Windows)
 
