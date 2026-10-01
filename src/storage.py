@@ -37,6 +37,7 @@ def write_markdown(data: dict) -> Path:
     """사람이 읽기 위한 브리핑 파일 data/YYYY-MM-DD.md 를 만든다 (브리핑 + 사용한 영상 목록)."""
     sources = "\n".join(
         f"- [{s.get('segment') or '일반'}] [{s['channel']}] [{s['title']}]({s['url']}) ({s['published_at'][:16]} KST)"
+        + (f"\n  - 선정 이유: {s['selection_reason']}" if s.get("selection_reason") else "")
         for s in data["summaries"]
     )
     path = _path(data["date"]).with_suffix(".md")

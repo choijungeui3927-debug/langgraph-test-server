@@ -1,6 +1,5 @@
 # src/nodes.py
 from datetime import date, datetime
-from itertools import zip_longest
 
 import httpx
 from langchain_openai import ChatOpenAI
@@ -12,8 +11,8 @@ from src.config import (
     DIGEST_MODEL,
     KST,
     MAX_TRANSCRIPT_CHARS,
-    MAX_VIDEOS_TOTAL,
     MIN_TRANSCRIPT_CHARS,
+    SELECT_MODEL,
     SUMMARY_MODEL,
     US_CLOSE_UPLOAD_BEFORE_HOUR,
     US_MARKET_KEYWORDS,
@@ -28,12 +27,19 @@ from src.facts import (
 )
 from src.state import NewsState, VideoState
 from src.storage import log_fact_errors, save_day
+from src.vectorstore import index_video, is_indexed, mmss, remove_other_videos
 from src.youtube import (
     ApifyBudgetExceededError,
     TranscriptBlockedError,
+    get_segments,
     get_transcript,
     list_videos_on,
 )
+
+
+def _log(message: str) -> None:
+    """진행 상황을 터미널에 바로 보여준다 (실행이 1~2분 걸려 멈춘 것처럼 보이지 않도록)."""
+    print(f"[{datetime.now(KST):%H:%M:%S}] {message}", flush=True)
 
 
 # ---------- 1. 영상 수집 ----------
@@ -43,13 +49,20 @@ def fetch_videos(state: NewsState) -> dict:
     target = date.fromisoformat(target_str)
     channels = state.get("channels") or CHANNELS
 
+    _log(f"1/5 영상 목록 수집 ({target_str}, 채널 {len(channels)}곳)")
     per_channel = []
     for handle, name in channels.items():
         try:
             per_channel.append(list_videos_on(handle, name, target))
+            _log(f"    {name}: 후보 {len(per_channel[-1])}개")
         except Exception as e:
-            print(f"[fetch_videos] {name}({handle}) 목록 수집 실패: {e}")
-    return {"target_date": target_str, "videos": _select_videos(per_channel, MAX_VIDEOS_TOTAL)}
+            _log(f"    {name}({handle}) 목록 수집 실패: {e}")
+
+    videos = _select_videos(per_channel, target_str)
+    _log(f"    선정 {len(videos)}개")
+    for v in videos:
+        _log(f"    - [{v.get('segment') or '일반'}] {v['channel']} {v['title'][:40]}")
+    return {"target_date": target_str, "videos": videos}
 
 
 # ---------- 1-2. 확정 숫자 수집 (요약 전에) ----------
@@ -59,20 +72,26 @@ def collect_facts(state: NewsState) -> dict:
 
     여기서 받은 자막은 캐시에 저장되므로 다음 요약 단계에서 다시 요청하지 않는다.
     """
+    _log("2/5 자막 수집 + 확정 숫자 수집 (KRX·ECOS)")
     texts = []
     for v in state.get("videos") or []:
         try:
-            texts.append(get_transcript(v["video_id"]) or "")
-        except (TranscriptBlockedError, ApifyBudgetExceededError, httpx.HTTPError):
-            pass  # 수집 실패 사유는 summarize_video에서 기록한다
+            text = get_transcript(v) or ""
+            texts.append(text)
+            _log(f"    자막 {len(text):,}자 — {v['title'][:40]}")
+        except (TranscriptBlockedError, ApifyBudgetExceededError, httpx.HTTPError) as e:
+            _log(f"    자막 실패 ({type(e).__name__}) — {v['title'][:40]}")  # 사유는 summarize_video에서 기록
 
     target = date.fromisoformat(state["target_date"])
     try:
         stock_names = extract_stocks(texts, target, exclude=set(CHANNELS.values()))
     except Exception as e:
-        print(f"[collect_facts] 종목 추출 실패: {e}")
+        _log(f"    종목 추출 실패: {e}")
         stock_names = []
-    return {"facts": get_market_facts(state["target_date"], stock_names)}
+    facts = get_market_facts(state["target_date"], stock_names)
+    _log(f"    종목 {len(facts['stocks'])}개 등락률 확정" + (f", 수집 오류: {facts['errors']}" if facts["errors"] else ""))
+    _log(f"3/5 영상 {len(state.get('videos') or [])}개 요약 (병렬)")
+    return {"facts": facts}
 
 
 def _closing_segment(video: dict) -> str | None:
@@ -88,33 +107,91 @@ def _closing_segment(video: dict) -> str | None:
     return None
 
 
-def _round_robin(per_channel: list[list[dict]]) -> list[dict]:
-    """채널을 번갈아 가며 최신 영상부터 나열한다. (한 채널 쏠림 방지)"""
-    ordered = []
-    for group in zip_longest(*per_channel):
-        ordered.extend(v for v in group if v is not None)
-    return ordered
+class _Pick(BaseModel):
+    index: int = Field(description="후보 번호")
+    reason: str = Field(description="이 영상이 그날 시황을 잘 보여주는 이유 (한 문장)")
 
 
-def _select_videos(per_channel: list[list[dict]], limit: int) -> list[dict]:
-    """마감 방송을 우선해 limit개를 고른다.
+class _Picks(BaseModel):
+    picks: list[_Pick]
 
-    1) 한국장 마감 1개, 미국장 마감 1개를 먼저 (두 시장을 모두 담기 위해)
-    2) 남은 마감 방송
-    3) 일반 영상 (채널을 번갈아 최신순)
-    """
-    ordered = _round_robin(per_channel)
-    for v in ordered:
-        v["segment"] = _closing_segment(v)
 
-    picked = []
+_SELECT_PROMPT = """당신은 금융·경제 뉴스 에디터입니다. 아래는 {date}에 유튜브 경제 채널에 올라온 영상 후보입니다.
+다음 채널마다 정확히 1개씩 고르세요: {channels}
+고른 영상들을 합쳤을 때 그날 시황(당일 한국장, 간밤 미국장)을 가장 잘 보여주도록 고릅니다.
+
+고르는 기준 (위가 우선):
+1. 그날 장을 정리하는 시황 방송 (장 마감·클로징·한국시황, 장중 시황, 장 시작 전 시황)
+2. 그날 시장을 움직인 핵심 이슈(지수, 수급, 주도 업종, 금리·환율, 주요 실적)를 다루는 분석
+3. 채널끼리 내용이 겹치지 않고, 시간대(장 전·장중·장 마감 후)가 다양할 것
+
+제외할 것: 개별 종목 상담·추천 위주, 세미나·행사 홍보, 가상자산·크립토, 시장과 무관한 주제(국방, 사회 사건 등), 1~3분짜리 단신
+업로드 시각은 KST입니다. 한국장은 15:30에 끝나고, 미국장은 다음 날 새벽(KST)에 끝납니다.
+
+이미 고른 영상 (후보가 하나뿐인 채널):
+{picked}
+
+후보:
+{candidates}"""
+
+
+def _describe(i: int | None, v: dict) -> str:
+    num = f"{i}. " if i is not None else "- "
+    seg = f" [{v['segment']}]" if v.get("segment") else ""
+    minutes = round((v.get("duration") or 0) / 60)
+    return f"{num}[{v['channel']}] {v['published_at'][11:16]} {minutes}분{seg} {v['title']}"
+
+
+def _llm_pick_per_channel(candidates: list[dict], picked: list[dict], channels: list[str], target_date: str) -> list[dict]:
+    """여러 채널의 후보를 한 번에 LLM에 보여주고 채널마다 1개씩 고른다."""
+    llm = ChatOpenAI(model=SELECT_MODEL).with_structured_output(_Picks)
+    result: _Picks = llm.invoke(_SELECT_PROMPT.format(
+        date=target_date,
+        channels=", ".join(channels),
+        picked="\n".join(_describe(None, v) for v in picked) or "(없음)",
+        candidates="\n".join(_describe(i, v) for i, v in enumerate(candidates)),
+    ))
+    chosen: dict[str, dict] = {}
+    for p in result.picks:
+        if 0 <= p.index < len(candidates):
+            v = candidates[p.index]
+            chosen.setdefault(v["channel"], {**v, "selection_reason": p.reason})  # 채널당 첫 선택만
+    return list(chosen.values())
+
+
+def _fallback_pick(videos: list[dict]) -> dict:
+    """LLM을 쓸 수 없을 때: 한국장 마감 → 미국장 마감 → 가장 최근 영상."""
     for segment in ("한국장 마감", "미국장 마감"):
-        first = next((v for v in ordered if v["segment"] == segment), None)
-        if first:
-            picked.append(first)
-    picked += [v for v in ordered if v["segment"] and v not in picked]
-    picked += [v for v in ordered if not v["segment"]]
-    return picked[:limit]
+        if found := next((v for v in videos if v["segment"] == segment), None):
+            return {**found, "selection_reason": f"대체 규칙: {segment} 방송"}
+    return {**videos[0], "selection_reason": "대체 규칙: 가장 최근 영상"}
+
+
+def _select_videos(per_channel: list[list[dict]], target_date: str) -> list[dict]:
+    """채널마다 그날 시황을 가장 잘 보여주는 영상을 1개씩 고른다.
+
+    1) 후보가 하나뿐인 채널은 그 영상을 쓴다
+    2) 후보가 여러 개인 채널들은 LLM이 한 번에 보고 채널마다 1개씩 고른다
+    3) LLM이 실패하거나 빠뜨린 채널은 한국장 마감 → 미국장 마감 → 최신순 규칙으로 채운다
+    """
+    groups = [g for g in per_channel if g]
+    for g in groups:
+        for v in g:
+            v["segment"] = _closing_segment(v)
+
+    picked = [{**g[0], "selection_reason": "그 채널의 그날 유일한 후보"} for g in groups if len(g) == 1]
+    multi = [g for g in groups if len(g) > 1]
+    if multi:
+        candidates = [v for g in multi for v in g]
+        try:
+            picked += _llm_pick_per_channel(candidates, picked, [g[0]["channel"] for g in multi], target_date)
+        except Exception as e:
+            _log(f"    LLM 영상 선정 실패, 규칙으로 대체: {e}")
+        done = {v["channel"] for v in picked}
+        picked += [_fallback_pick(g) for g in multi if g[0]["channel"] not in done]
+
+    order = {g[0]["channel"]: i for i, g in enumerate(groups)}  # 채널 설정 순서대로
+    return sorted(picked, key=lambda v: order[v["channel"]])
 
 
 # ---------- 2. 영상별 요약 (병렬) ----------
@@ -139,7 +216,7 @@ _SUMMARY_PROMPT = """다음은 한국어 금융·경제 유튜브 영상의 자�
 def summarize_video(state: VideoState) -> dict:
     video = state["video"]
     try:
-        transcript = get_transcript(video["video_id"])
+        transcript = get_transcript(video)
     except TranscriptBlockedError:
         return {"skipped": [{**video, "reason": "유튜브 IP 차단으로 자막 수집 실패"}]}
     except ApifyBudgetExceededError:
@@ -155,6 +232,7 @@ def summarize_video(state: VideoState) -> dict:
         title=video["title"],
         transcript=transcript[:MAX_TRANSCRIPT_CHARS],
     ))
+    _log(f"    요약 완료 — {video['title'][:40]}")
     return {"summaries": [{**video, **result.model_dump()}]}
 
 
@@ -223,6 +301,7 @@ def write_digest(state: NewsState) -> dict:
         return {"digest": f"{target_date}에 요약할 수 있는 뉴스 영상이 없습니다."}
 
     summaries = sorted(summaries, key=lambda s: s["published_at"])
+    _log(f"4/5 브리핑 작성 ({DIGEST_MODEL})")
     llm = ChatOpenAI(model=DIGEST_MODEL)
     prompt = _DIGEST_PROMPT.format(
         date=target_date,
@@ -236,7 +315,9 @@ def write_digest(state: NewsState) -> dict:
     fact_check = {"first_errors": [], "final_errors": [], "regenerated": False}
     if facts:
         fact_check["first_errors"] = verify(body, facts)
+        _log(f"    숫자 검증: 오류 {len(fact_check['first_errors'])}건")
         if fact_check["first_errors"]:
+            _log("    확정 숫자와 다른 부분이 있어 브리핑을 1회 다시 작성")
             body = llm.invoke(_RETRY_PROMPT.format(
                 errors="\n".join(f"- {e}" for e in fact_check["first_errors"]), digest=body,
             )).content
@@ -248,4 +329,41 @@ def write_digest(state: NewsState) -> dict:
     digest = _insert_numbers(body, render_numbers(facts)) if facts else body
     # 채팅 그래프에서 그날 뉴스를 다시 불러올 수 있도록 저장
     save_day(target_date, state.get("videos") or [], summaries, digest, facts, fact_check)
+    _log(f"    저장 완료: data/{target_date}.md")
     return {"digest": digest, "fact_check": fact_check}
+
+
+# ---------- 4. 채팅 검색용 자막 색인 ----------
+
+def index_day(target_date: str, videos: list[dict], force: bool = False) -> int:
+    """영상 자막 전체를 타임스탬프 청크로 나눠 벡터 DB(ChromaDB)에 저장한다. 저장한 청크 수를 반환.
+
+    예전 형식(.txt) 자막은 타임스탬프가 없어 다시 받는다 (차단 시 Apify, 영상당 약 $0.01).
+    """
+    total = 0
+    for v in videos:
+        if not force and is_indexed(v["video_id"]):
+            _log(f"    이미 색인됨 — {v['title'][:40]}")
+            continue
+        try:
+            segments = get_segments(v)
+        except (TranscriptBlockedError, ApifyBudgetExceededError, httpx.HTTPError) as e:
+            _log(f"    자막 실패 ({type(e).__name__}) — {v['title'][:40]}")
+            continue
+        if not segments:
+            _log(f"    자막 없음 — {v['title'][:40]}")
+            continue
+        n = index_video(v, target_date, segments)
+        total += n
+        _log(f"    청크 {n}개 저장 ({mmss(segments[-1]['start'])} 분량) — {v['title'][:40]}")
+    return total
+
+
+def index_transcripts(state: NewsState) -> dict:
+    summaries = state.get("summaries") or []
+    _log(f"5/5 채팅 검색용 자막 색인 (bge-m3 → ChromaDB, 영상 {len(summaries)}개)")
+    removed = remove_other_videos(state["target_date"], {s["video_id"] for s in summaries})
+    if removed:
+        _log(f"    이번에 선정되지 않은 영상의 청크 {removed}개 삭제")
+    index_day(state["target_date"], summaries)
+    return {}
