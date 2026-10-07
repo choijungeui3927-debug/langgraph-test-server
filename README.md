@@ -89,6 +89,13 @@ uv run python -m src.run 2026-09-29   # 브리핑
 uv run langgraph dev                  # Studio
 ```
 
+**3. 대화일지 저장** — 시장일마다 `data/chats/날짜_대화요약.md` 하나 (다시 저장하면 새 질문만 `## 저장 N`으로 이어 붙임)
+
+- 채팅창에서: "대화일지 저장해줘" → 범위 선택 (1. 이 대화창만 / 2. 그 시장일의 모든 대화창) 또는 "취소"
+- 명령으로: `uv run python -m src.chat_summary 2026-10-06` (그 시장일의 모든 대화, LangSmith 기록 기준)
+- 매일 자동: Windows 작업 스케줄러 `YoutubeFinance_ChatSummary`가 23:30에 `chat_summary_auto.bat` 실행 → 마지막 실행 이후 새 대화가 있는 시장일만 저장 (기록: `logs/chat_summary_auto.log`)
+- 한 질문에서 여러 날짜를 물으면(예: "10월 1일이랑 비교하면?") 해당 날짜 파일 모두에 저장됩니다.
+
 ## 자막을 가져오는 순서와 비용
 
 1. `data/transcripts/`에 저장된 자막
