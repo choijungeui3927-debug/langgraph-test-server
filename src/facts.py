@@ -123,10 +123,18 @@ def stock_change(names: list[str], target: date) -> dict:
 _PARTICLE_START = set("가이은는을를도와과의에로만까랑하보처부께요죠")
 
 
+def _starts_word(text: str, start: int) -> bool:
+    """앞 글자가 한글·영문·숫자가 아니면 단어의 시작이다 ('SK하이닉스' 속 '이닉스'는 단어 시작이 아님)."""
+    prev = text[start - 1: start]
+    return not prev or not (prev.isalnum() or "가" <= prev <= "힣")
+
+
 def _count_as_word(text: str, name: str) -> int:
     count = 0
     for m in re.finditer(re.escape(name), text):
         nxt = text[m.end(): m.end() + 1]
+        if not _starts_word(text, m.start()):
+            continue
         if not nxt or not ("가" <= nxt <= "힣") or nxt in _PARTICLE_START:
             count += 1
     return count
@@ -300,8 +308,11 @@ def verify(text: str, facts: dict) -> list[str]:
         if not sentence or not sentence.strip():
             continue
         is_outlook = any(w in sentence for w in _OUTLOOK_WORDS)
-        # 지수: 등락률과 수준
+        is_period = any(w in sentence for w in _PERIOD_WORDS)
+        # 지수: 등락률과 수준. '지난주 코스피 1% 하락' 같은 기간 등락률은 그날 숫자와 비교하지 않는다
         for name, x in indices.items():
+            if is_period:
+                continue
             for m in re.finditer(name, sentence):
                 win = _window(sentence, m.end(), [w for w in entity_words if w != name])
                 for p in _PCT.finditer(win):
@@ -320,6 +331,8 @@ def verify(text: str, facts: dict) -> list[str]:
         # 종목 등락률: 종목명 바로 뒤의 첫 번째 % 하나만 (그 뒤는 다른 종목 숫자일 수 있음)
         for name, x in stocks.items():
             for m in re.finditer(re.escape(name), sentence):
+                if not _starts_word(sentence, m.start()):
+                    continue  # 더 긴 종목명의 일부 ('SK하이닉스' 속 '이닉스')
                 win = _window(sentence, m.end(), [w for w in entity_words if w != name], size=30)
                 p = _PCT.search(win)
                 if p and not _is_change(p, win):

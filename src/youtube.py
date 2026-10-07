@@ -25,7 +25,10 @@ from src.config import (
     KST,
     MAX_VIDEO_SECONDS,
     MAX_VIDEOS_PER_CHANNEL,
+    MAX_VIDEOS_PER_CHANNEL_LIMIT,
+    VIDEOS_PER_DAY_BACK,
     TRANSCRIPT_DIR,
+    UPLOAD_TIMES_PATH,
 )
 
 
@@ -52,13 +55,19 @@ def _make_transcript_api() -> YouTubeTranscriptApi:
 _transcript_api = _make_transcript_api()
 
 
-def _list_entries(handle: str, lang: str | None = None) -> list[dict]:
+def _list_depth(target: date) -> int:
+    """지난 날짜일수록 더 많은 최신 영상을 훑는다 (하루 15~20개씩 올리는 채널 대비)."""
+    days_back = max((datetime.now(KST).date() - target).days, 0)
+    return min(MAX_VIDEOS_PER_CHANNEL + VIDEOS_PER_DAY_BACK * days_back, MAX_VIDEOS_PER_CHANNEL_LIMIT)
+
+
+def _list_entries(handle: str, depth: int, lang: str | None = None) -> list[dict]:
     extractor_args = {"youtubetab": {"approximate_date": ["true"]}}
     if lang:
         extractor_args["youtube"] = {"lang": [lang]}
     opts = {
         "extract_flat": True,
-        "playlistend": MAX_VIDEOS_PER_CHANNEL,
+        "playlistend": depth,
         "quiet": True,
         "no_warnings": True,
         "extractor_args": extractor_args,
@@ -68,15 +77,59 @@ def _list_entries(handle: str, lang: str | None = None) -> list[dict]:
     return info.get("entries") or []
 
 
+def _load_upload_times() -> dict[str, int]:
+    path = Path(UPLOAD_TIMES_PATH)
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def _save_upload_times(times: dict[str, int]) -> None:
+    path = Path(UPLOAD_TIMES_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(times), encoding="utf-8")
+
+
 def _exact_timestamp(video_id: str) -> int | None:
-    """영상 페이지에서 정확한 업로드 시각(Unix 초)을 가져온다. 자막 요청과 달리 IP 차단 대상이 아니다."""
-    opts = {"skip_download": True, "quiet": True, "no_warnings": True}
+    """영상 페이지에서 정확한 업로드 시각(Unix 초)을 가져온다.
+
+    요청이 몰리면 YouTube가 '봇이 아닌지 확인' 로그인을 요구해 실패할 수 있다 → None.
+    """
+    opts = {"skip_download": True, "quiet": True, "no_warnings": True, "noprogress": True, "logger": _SilentLogger()}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False, process=False)
     except Exception:
         return None
     return info.get("timestamp") or info.get("release_timestamp")
+
+
+class _SilentLogger:
+    """봇 확인 실패 메시지가 진행 로그를 덮지 않도록 yt-dlp 출력을 숨긴다."""
+    def debug(self, msg): pass
+    def warning(self, msg): pass
+    def error(self, msg): pass
+
+
+_TITLE_FULL_DATE = re.compile(r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일")
+_TITLE_MONTH_DAY = re.compile(r"(?<!\d)(\d{1,2})월\s*(\d{1,2})일")
+_TITLE_YYMMDD = re.compile(r"(?<!\d)(\d{2})(\d{2})(\d{2})(?!\d)")
+
+
+def _title_date(title: str, year: int) -> date | None:
+    """제목에 적힌 방송 날짜 ('2026년 10월 1일', '10월 1일', '261001'). 없으면 None."""
+    candidates = []
+    if m := _TITLE_FULL_DATE.search(title):
+        candidates.append((int(m.group(1)), int(m.group(2)), int(m.group(3))))
+    if m := _TITLE_MONTH_DAY.search(title):
+        candidates.append((year, int(m.group(1)), int(m.group(2))))
+    for m in _TITLE_YYMMDD.finditer(title):
+        if int(m.group(1)) == year % 100:
+            candidates.append((2000 + int(m.group(1)), int(m.group(2)), int(m.group(3))))
+    for y, mo, d in candidates:
+        try:
+            return date(y, mo, d)
+        except ValueError:
+            continue
+    return None
 
 
 def list_videos_on(handle: str, channel_name: str, target: date) -> list[dict]:
@@ -88,38 +141,59 @@ def list_videos_on(handle: str, channel_name: str, target: date) -> list[dict]:
     yt-dlp는 영어 상대 표기만 해석할 수 있으므로 날짜는 기본(영어) 조회에서,
     제목은 자동 번역되지 않은 원문을 얻기 위해 한국어 조회에서 가져온다.
     """
+    depth = _list_depth(target)
     entries = [
-        e for e in _list_entries(handle)
+        e for e in _list_entries(handle, depth)
         if e.get("timestamp") is not None
         and e.get("live_status") not in ("is_live", "is_upcoming")
         and (e.get("duration") or 0) <= MAX_VIDEO_SECONDS  # 토큰 비용 때문에 너무 긴 영상 제외
     ]
-    ko_titles = {e["id"]: e.get("title") for e in _list_entries(handle, lang="ko")}
+    ko_titles = {e["id"]: e.get("title") for e in _list_entries(handle, depth, lang="ko")}
 
-    # 일 단위 근사값이고 target 앞뒤 하루 안에 있는 영상만 정확한 시각을 다시 조회
+    # 일 단위 근사값('5 days ago')이고 target 앞뒤 하루 안에 있는 영상은 정확한 시각을 다시 조회.
+    # 한 번 얻은 시각은 파일에 저장해 다시 요청하지 않는다 (요청이 몰리면 YouTube가 봇 확인을 요구함)
     now = datetime.now(KST).timestamp()
-    to_refine = [
-        e for e in entries
+    coarse = {
+        e["id"] for e in entries
         if now - e["timestamp"] >= COARSE_TIMESTAMP_AGE_SECONDS
         and abs((datetime.fromtimestamp(e["timestamp"], KST).date() - target).days) <= 1
-    ]
+    }
+    known = _load_upload_times()
+    missing = [vid for vid in coarse if vid not in known]
     with ThreadPoolExecutor(max_workers=4) as pool:
-        exact = dict(zip((e["id"] for e in to_refine), pool.map(_exact_timestamp, (e["id"] for e in to_refine))))
+        fetched = dict(zip(missing, pool.map(_exact_timestamp, missing)))
+    if any(fetched.values()):
+        known.update({vid: ts for vid, ts in fetched.items() if ts})
+        _save_upload_times(known)
 
-    videos = []
+    videos, dropped = [], 0
     for entry in entries:
-        ts = exact.get(entry["id"]) or entry["timestamp"]
-        published = datetime.fromtimestamp(ts, KST)
+        vid = entry["id"]
+        title = ko_titles.get(vid) or entry.get("title") or ""
+        estimated = False
+        if vid not in coarse:
+            published = datetime.fromtimestamp(entry["timestamp"], KST)
+        elif vid in known:
+            published = datetime.fromtimestamp(known[vid], KST)
+        elif day := _title_date(title, target.year):
+            # 정확한 시각을 못 얻으면 대략적인 날짜는 믿지 않고, 제목에 적힌 날짜를 쓴다 (시각은 모름 → 정오로 표기)
+            published, estimated = datetime(day.year, day.month, day.day, 12, tzinfo=KST), True
+        else:
+            dropped += 1  # 날짜를 확정할 수 없어 후보에서 뺀다
+            continue
         if published.date() != target:
             continue
         videos.append({
-            "video_id": entry["id"],
-            "title": ko_titles.get(entry["id"]) or entry.get("title") or "",
+            "video_id": vid,
+            "title": title,
             "channel": channel_name,
-            "url": f"https://www.youtube.com/watch?v={entry['id']}",
+            "url": f"https://www.youtube.com/watch?v={vid}",
             "published_at": published.isoformat(),
+            "published_estimated": estimated,
             "duration": entry.get("duration"),
         })
+    if dropped:
+        print(f"    {channel_name}: 업로드 날짜를 확정하지 못한 영상 {dropped}개는 후보에서 제외", flush=True)
     return videos
 
 

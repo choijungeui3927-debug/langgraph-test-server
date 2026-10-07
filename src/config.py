@@ -11,8 +11,11 @@ CHANNELS: dict[str, str] = {
     "@koreanstockrider": "증시각도기TV",
 }
 
-# 채널당 최신순으로 훑어볼 최대 영상 수 (이 중 그날 올라온 영상이 선정 후보)
+# 채널당 최신순으로 훑어볼 영상 수 (이 중 그날 올라온 영상이 선정 후보)
+# 하루 15~20개씩 올리는 채널이 있어, 지난 날짜일수록 더 깊이 본다: 기본 + 경과 일수 × 하루치, 최대값까지
 MAX_VIDEOS_PER_CHANNEL = 30
+VIDEOS_PER_DAY_BACK = 25
+MAX_VIDEOS_PER_CHANNEL_LIMIT = 200
 
 # 마감 방송 우선 선별
 # - 한국장은 당일 15:30(KST)에 끝나므로 그날 오후·저녁의 '마감' 영상이 당일 한국장을 다룬다.
@@ -41,6 +44,9 @@ DATA_DIR = "data"
 
 # 자막 청크 검색용 벡터 DB와 로컬 임베딩 모델 (처음 한 번 약 2.2GB 내려받음)
 CHROMA_DIR = "data/chroma"
+
+# 영상 페이지에서 얻은 정확한 업로드 시각 캐시 (다시 요청하지 않아 YouTube 봇 확인을 피함)
+UPLOAD_TIMES_PATH = "data/upload_times.json"
 EMBEDDING_MODEL = "BAAI/bge-m3"
 
 # 숫자 검증 실패 등 실행 로그를 남기는 폴더

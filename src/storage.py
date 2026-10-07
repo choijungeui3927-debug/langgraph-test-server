@@ -1,6 +1,7 @@
 # src/storage.py
 """날짜별 요약 결과를 data/YYYY-MM-DD.json 으로 저장하고 읽는다."""
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -64,5 +65,6 @@ def load_day(target_date: str) -> dict | None:
 
 
 def list_days() -> list[str]:
-    """저장된 날짜 목록 (최신순)."""
-    return sorted((p.stem for p in Path(DATA_DIR).glob("*.json")), reverse=True)
+    """저장된 브리핑 날짜 목록 (최신순). data/ 안의 다른 JSON(업로드 시각 캐시 등)은 제외한다."""
+    days = (p.stem for p in Path(DATA_DIR).glob("*.json"))
+    return sorted((d for d in days if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d)), reverse=True)
